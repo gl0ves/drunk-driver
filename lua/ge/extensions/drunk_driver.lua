@@ -93,7 +93,7 @@ local personas = {
   },
 }
 
--- Track assigned personas per vehicle
+-- Track assigned personas and their rolled values per vehicle
 local vehiclePersonas = {}
 
 -- Total weight for weighted random selection
@@ -102,12 +102,10 @@ for _, p in ipairs(personas) do
   totalWeight = totalWeight + p.weight
 end
 
--- Pick a random value within a range
 local function randRange(range)
   return range[1] + math.random() * (range[2] - range[1])
 end
 
--- Weighted random persona selection
 local function pickPersona()
   local roll = math.random() * totalWeight
   local cumulative = 0
@@ -120,25 +118,16 @@ local function pickPersona()
   return personas[#personas]
 end
 
--- Apply a persona's settings to a vehicle
-local function applyPersona(veh, persona)
-  local aggression = randRange(persona.aggression)
-  local speed = randRange(persona.speed)
-
-  veh:queueLuaCommand(string.format('ai.setAggression(%f)', aggression))
-  veh:queueLuaCommand(string.format('ai.setSpeed(%f)', speed))
-  veh:queueLuaCommand(string.format('ai.setSpeedMode("%s")', persona.speedMode))
-  veh:queueLuaCommand(string.format('ai.driveInLane("%s")', persona.driveInLane))
-  veh:queueLuaCommand(string.format('ai.setAvoidCars("%s")', persona.avoidCars))
-
-  if persona.params then
-    local paramStr = "{"
-    for k, v in pairs(persona.params) do
-      paramStr = paramStr .. string.format('%s = %f, ', k, v)
-    end
-    paramStr = paramStr .. "}"
-    veh:queueLuaCommand(string.format('ai.setParameters(%s)', paramStr))
+-- Build the vlua command string for a persona
+local function buildVluaCmd(data)
+  local cmd = string.format(
+    'ai.setAggression(%f); ai.setSpeed(%f); ai.setSpeedMode("%s"); ai.driveInLane("%s"); ai.setAvoidCars("%s")',
+    data.aggression, data.speed, data.speedMode, data.driveInLane, data.avoidCars
+  )
+  if data.paramStr then
+    cmd = cmd .. string.format('; ai.setParameters(%s)', data.paramStr)
   end
+  return cmd
 end
 
 local function isPlayerVehicle(vid)
@@ -146,88 +135,86 @@ local function isPlayerVehicle(vid)
   return playerVeh and playerVeh:getID() == vid
 end
 
--- Hook: called when any vehicle spawns
-local function onVehicleSpawned(gameVehicleID)
-  if isPlayerVehicle(gameVehicleID) then return end
-
-  local veh = be:getObjectByID(gameVehicleID)
-  if not veh then return end
-
+-- Assign a persona to a vehicle and roll its values
+local function assignPersona(vid)
   local persona = pickPersona()
-  vehiclePersonas[gameVehicleID] = persona
-
-  -- Small delay to let the vehicle initialize before applying AI settings
-  local vid = gameVehicleID
-  local function delayedApply()
-    local v = be:getObjectByID(vid)
-    if v then
-      applyPersona(v, persona)
-      log('I', 'drunkDriver', string.format('Vehicle %d assigned persona: %s', vid, persona.name))
+  local paramStr = nil
+  if persona.params then
+    paramStr = "{"
+    for k, v in pairs(persona.params) do
+      paramStr = paramStr .. string.format('%s = %f, ', k, v)
     end
+    paramStr = paramStr .. "}"
   end
 
-  -- Schedule for next frame via onUpdate
-  M._pendingApply = M._pendingApply or {}
-  table.insert(M._pendingApply, {fn = delayedApply, delay = 0.5, elapsed = 0})
+  local data = {
+    name = persona.name,
+    aggression = randRange(persona.aggression),
+    speed = randRange(persona.speed),
+    speedMode = persona.speedMode,
+    driveInLane = persona.driveInLane,
+    avoidCars = persona.avoidCars,
+    paramStr = paramStr,
+  }
+  data.vluaCmd = buildVluaCmd(data)
+
+  vehiclePersonas[vid] = data
+  log('I', 'drunk_driver', string.format('Vehicle %d assigned persona: %s (aggression=%.2f, driveInLane=%s)', vid, persona.name, data.aggression, data.driveInLane))
+  return data
 end
 
--- Hook: clean up when vehicle is removed
+-- Inject our overrides into the traffic vehicle's queuedFuncs
+-- These run INSIDE the traffic system's own update loop, AFTER setAiMode resets things
+local function injectOverride(vid, data)
+  if not gameplay_traffic then return end
+  local trafficData = gameplay_traffic.getTrafficData()
+  if not trafficData then return end
+  local trafficVeh = trafficData[vid]
+  if not trafficVeh then return end
+
+  -- Use the traffic vehicle's own queuedFuncs mechanism
+  -- Timer of 0 means it executes next frame inside the traffic update loop
+  trafficVeh.queuedFuncs = trafficVeh.queuedFuncs or {}
+  trafficVeh.queuedFuncs.drunk_driver = {timer = 0, vLua = data.vluaCmd}
+end
+
+local function onVehicleSpawned(gameVehicleID)
+  if isPlayerVehicle(gameVehicleID) then return end
+  assignPersona(gameVehicleID)
+end
+
 local function onVehicleDestroyed(gameVehicleID)
   vehiclePersonas[gameVehicleID] = nil
 end
 
--- Hook: re-apply persona on vehicle reset
-local function onVehicleResetted(gameVehicleID)
-  if isPlayerVehicle(gameVehicleID) then return end
-
-  local veh = be:getObjectByID(gameVehicleID)
-  local persona = vehiclePersonas[gameVehicleID]
-  if veh and persona then
-    M._pendingApply = M._pendingApply or {}
-    table.insert(M._pendingApply, {
-      fn = function()
-        local v = be:getObjectByID(gameVehicleID)
-        if v then applyPersona(v, persona) end
-      end,
-      delay = 0.5,
-      elapsed = 0,
-    })
-  end
-end
-
--- Process delayed applications
+-- Continuously re-inject overrides every frame via the traffic system's own queuedFuncs
 local function onUpdate(dtReal, dtSim, dtRaw)
-  if not M._pendingApply then return end
+  if not gameplay_traffic then return end
+  local trafficData = gameplay_traffic.getTrafficData()
+  if not trafficData then return end
 
-  local remaining = {}
-  for _, entry in ipairs(M._pendingApply) do
-    entry.elapsed = entry.elapsed + dtReal
-    if entry.elapsed >= entry.delay then
-      entry.fn()
-    else
-      table.insert(remaining, entry)
+  for vid, data in pairs(vehiclePersonas) do
+    local trafficVeh = trafficData[vid]
+    if trafficVeh and trafficVeh.isAi and not isPlayerVehicle(vid) then
+      -- Continuously inject via queuedFuncs — this runs inside the traffic update loop
+      -- so it executes AFTER setAiMode/resetAction override our settings
+      trafficVeh.queuedFuncs = trafficVeh.queuedFuncs or {}
+      trafficVeh.queuedFuncs.drunk_driver = {timer = 0, vLua = data.vluaCmd}
     end
-  end
-
-  if #remaining > 0 then
-    M._pendingApply = remaining
-  else
-    M._pendingApply = nil
   end
 end
 
 local function onInit()
-  log('I', 'drunkDriver', 'Drunk Driver mod loaded - traffic personas active')
+  log('I', 'drunk_driver', 'Drunk Driver mod loaded - traffic personas active')
 end
 
--- Public API for other mods or console use
 local function getVehiclePersona(vid)
   return vehiclePersonas[vid]
 end
 
 local function listPersonas()
   for _, p in ipairs(personas) do
-    log('I', 'drunkDriver', string.format('  %s (weight: %d, aggression: %.1f-%.1f, speed: %.0f-%.0f m/s)',
+    log('I', 'drunk_driver', string.format('  %s (weight: %d, aggression: %.1f-%.1f, speed: %.0f-%.0f m/s)',
       p.name, p.weight, p.aggression[1], p.aggression[2], p.speed[1], p.speed[2]))
   end
 end
@@ -236,7 +223,6 @@ M.onInit = onInit
 M.onUpdate = onUpdate
 M.onVehicleSpawned = onVehicleSpawned
 M.onVehicleDestroyed = onVehicleDestroyed
-M.onVehicleResetted = onVehicleResetted
 M.getVehiclePersona = getVehiclePersona
 M.listPersonas = listPersonas
 
