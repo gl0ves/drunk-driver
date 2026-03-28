@@ -1,2 +1,2 @@
-load("drunk_driver")
+load("extensions.drunk_driver")
 setExtensionUnloadMode("drunk_driver", "manual")

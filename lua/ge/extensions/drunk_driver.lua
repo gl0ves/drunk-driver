@@ -93,14 +93,15 @@ local personas = {
   },
 }
 
--- Track assigned personas and their rolled values per vehicle
 local vehiclePersonas = {}
 
--- Total weight for weighted random selection
 local totalWeight = 0
 for _, p in ipairs(personas) do
   totalWeight = totalWeight + p.weight
 end
+
+local reapplyInterval = 0.5
+local reapplyTimer = 0
 
 local function randRange(range)
   return range[1] + math.random() * (range[2] - range[1])
@@ -118,7 +119,6 @@ local function pickPersona()
   return personas[#personas]
 end
 
--- Build the vlua command string for a persona
 local function buildVluaCmd(data)
   local cmd = string.format(
     'ai.setAggression(%f); ai.setSpeed(%f); ai.setSpeedMode("%s"); ai.driveInLane("%s"); ai.setAvoidCars("%s")',
@@ -135,7 +135,6 @@ local function isPlayerVehicle(vid)
   return playerVeh and playerVeh:getID() == vid
 end
 
--- Assign a persona to a vehicle and roll its values
 local function assignPersona(vid)
   local persona = pickPersona()
   local paramStr = nil
@@ -163,43 +162,31 @@ local function assignPersona(vid)
   return data
 end
 
--- Inject our overrides into the traffic vehicle's queuedFuncs
--- These run INSIDE the traffic system's own update loop, AFTER setAiMode resets things
-local function injectOverride(vid, data)
-  if not gameplay_traffic then return end
-  local trafficData = gameplay_traffic.getTrafficData()
-  if not trafficData then return end
-  local trafficVeh = trafficData[vid]
-  if not trafficVeh then return end
-
-  -- Use the traffic vehicle's own queuedFuncs mechanism
-  -- Timer of 0 means it executes next frame inside the traffic update loop
-  trafficVeh.queuedFuncs = trafficVeh.queuedFuncs or {}
-  trafficVeh.queuedFuncs.drunk_driver = {timer = 0, vLua = data.vluaCmd}
+local function applyPersona(vid, data)
+  local veh = be:getObjectByID(vid)
+  if veh then
+    veh:queueLuaCommand(data.vluaCmd)
+  end
 end
 
 local function onVehicleSpawned(gameVehicleID)
   if isPlayerVehicle(gameVehicleID) then return end
-  assignPersona(gameVehicleID)
+  local data = assignPersona(gameVehicleID)
+  applyPersona(gameVehicleID, data)
 end
 
 local function onVehicleDestroyed(gameVehicleID)
   vehiclePersonas[gameVehicleID] = nil
 end
 
--- Continuously re-inject overrides every frame via the traffic system's own queuedFuncs
 local function onUpdate(dtReal, dtSim, dtRaw)
-  if not gameplay_traffic then return end
-  local trafficData = gameplay_traffic.getTrafficData()
-  if not trafficData then return end
+  reapplyTimer = reapplyTimer + dtSim
+  if reapplyTimer < reapplyInterval then return end
+  reapplyTimer = 0
 
   for vid, data in pairs(vehiclePersonas) do
-    local trafficVeh = trafficData[vid]
-    if trafficVeh and trafficVeh.isAi and not isPlayerVehicle(vid) then
-      -- Continuously inject via queuedFuncs — this runs inside the traffic update loop
-      -- so it executes AFTER setAiMode/resetAction override our settings
-      trafficVeh.queuedFuncs = trafficVeh.queuedFuncs or {}
-      trafficVeh.queuedFuncs.drunk_driver = {timer = 0, vLua = data.vluaCmd}
+    if not isPlayerVehicle(vid) then
+      applyPersona(vid, data)
     end
   end
 end
