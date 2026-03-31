@@ -1,22 +1,71 @@
 local M = {}
+local im = ui_imgui
 
 local personas = {
   {
+    name = "Normal",
+    weight = 84,
+    aggression = {0.3, 0.6},
+    speed = {10, 18},
+    speedMode = "legal",
+    driveInLane = "on",
+    avoidCars = "on",
+  },
+  {
+    name = "Tipsy",
+    weight = 3,
+    aggression = {0.5, 0.8},
+    speed = {10, 20},
+    speedMode = "legal",
+    driveInLane = "on",
+    avoidCars = "on",
+    params = {
+      awarenessForceCoef = 0.4,
+      turnForceCoef = 0.5,
+      lookAheadKv = 0.6,
+    },
+    steerWobble = {amp = 0.05, freq1 = 1.0, freq2 = 0.4},
+  },
+  {
     name = "Drunk",
+    weight = 2,
+    aggression = {0.8, 1.2},
+    speed = {12, 22},
+    speedMode = "set",
+    driveInLane = "off",
+    avoidCars = "on",
+    params = {
+      awarenessForceCoef = 0.2,
+      turnForceCoef = 0.3,
+      lookAheadKv = 0.4,
+      trafficWaitTime = 0.5,
+    },
+    steerWobble = {amp = 0.12, freq1 = 1.5, freq2 = 0.6},
+  },
+  {
+    name = "Wasted",
     weight = 1,
-    aiMode = "span",
-    aggression = {0.6, 1.2},
-    speed = {12, 28},
-    speedMode = "limit",
+    aggression = {1.0, 1.5},
+    speed = {14, 28},
+    speedMode = "set",
     driveInLane = "off",
     avoidCars = "off",
     params = {
-      awarenessForceCoef = 0.2,
-      turnForceCoef = 0.5,
-      lookAheadKv = 0.4,
-      trafficWaitTime = 5.0,
+      awarenessForceCoef = 0.1,
+      turnForceCoef = 0.3,
+      lookAheadKv = 0.3,
+      trafficWaitTime = 0.5,
     },
-    steerWobble = {amp = 0.15, freq1 = 1.5, freq2 = 0.6},
+    steerWobble = {amp = 0.2, freq1 = 1.5, freq2 = 0.6},
+  },
+  {
+    name = "Speed Demon",
+    weight = 2,
+    aggression = {1.2, 1.5},
+    speed = {30, 45},
+    speedMode = "set",
+    driveInLane = "on",
+    avoidCars = "on",
   },
 }
 
@@ -25,6 +74,114 @@ local vehiclePersonas = {}
 local totalWeight = 0
 for _, p in ipairs(personas) do
   totalWeight = totalWeight + p.weight
+end
+
+-- Store defaults before settings load
+local defaultWeights = {}
+for i, p in ipairs(personas) do
+  defaultWeights[i] = p.weight
+end
+
+-- Settings persistence
+local settingsPath = 'settings/drunk_driver/settings.json'
+
+local function recalcTotalWeight()
+  totalWeight = 0
+  for _, p in ipairs(personas) do
+    totalWeight = totalWeight + p.weight
+  end
+end
+
+local function saveSettings()
+  local data = {}
+  for _, p in ipairs(personas) do
+    data[p.name] = p.weight
+  end
+  jsonWriteFile(settingsPath, data, true)
+  log('W', 'drunk_driver', 'Settings saved')
+end
+
+local function loadSettings()
+  local data = jsonReadFile(settingsPath)
+  if not data then return end
+  for _, p in ipairs(personas) do
+    if data[p.name] then
+      p.weight = data[p.name]
+    end
+  end
+  recalcTotalWeight()
+  log('W', 'drunk_driver', 'Settings loaded')
+end
+
+-- UI state
+local showUI = false
+local weightPtrs = nil
+
+local function initWeightPtrs()
+  weightPtrs = {}
+  for i, p in ipairs(personas) do
+    weightPtrs[i] = im.IntPtr(p.weight)
+  end
+end
+
+local function toggleSettings()
+  showUI = not showUI
+  if showUI then
+    if not weightPtrs then initWeightPtrs() end
+    for i, p in ipairs(personas) do
+      weightPtrs[i][0] = p.weight
+    end
+  end
+end
+
+local function renderSettingsWindow()
+  if not showUI then return end
+  if not weightPtrs then initWeightPtrs() end
+
+  im.SetNextWindowSize(im.ImVec2(400, 0), im.Cond_FirstUseEver)
+  local open = im.BoolPtr(true)
+  if im.Begin("Drunk Driver Settings", open) then
+    im.Text("Adjust how often each persona appears in traffic.")
+    im.Separator()
+
+    local changed = false
+    for i, p in ipairs(personas) do
+      if im.SliderInt(p.name .. "##weight", weightPtrs[i], 0, 100) then
+        p.weight = weightPtrs[i][0]
+        changed = true
+      end
+      local pct = totalWeight > 0 and (p.weight / totalWeight * 100) or 0
+      im.SameLine()
+      im.Text(string.format("%.1f%%", pct))
+    end
+
+    if changed then
+      recalcTotalWeight()
+    end
+
+    im.Separator()
+
+    if im.Button("Save") then
+      saveSettings()
+    end
+    im.SameLine()
+    if im.Button("Reset Defaults") then
+      for i, p in ipairs(personas) do
+        p.weight = defaultWeights[i]
+        weightPtrs[i][0] = defaultWeights[i]
+      end
+      recalcTotalWeight()
+    end
+    im.SameLine()
+    if im.Button("Reassign All Traffic") then
+      vehiclePersonas = {}
+    end
+  end
+  im.End()
+
+  if not open[0] then
+    showUI = false
+  end
 end
 
 local reapplyInterval = 0.1
@@ -69,14 +226,15 @@ local function buildSteerHookCmd(wobble)
   return string.format([[
     if not _dd_steer then
       _dd_steer = {t = 0, amp = %f, f1 = %f, f2 = %f}
-      local _dd_gfx = updateGFX
+      local _origUpdateGFX = updateGFX
       updateGFX = function(dt)
-        if _dd_gfx then _dd_gfx(dt) end
+        if _origUpdateGFX then _origUpdateGFX(dt) end
         _dd_steer.t = _dd_steer.t + dt
         local w = math.sin(_dd_steer.t * _dd_steer.f1 * 6.283) * _dd_steer.amp
                 + math.sin(_dd_steer.t * _dd_steer.f2 * 6.283) * _dd_steer.amp * 0.5
-        local s = electrics.values.steering
-        if s then electrics.values.steering = s + w end
+        local steerVal = electrics.values.steering_input or electrics.values.steering or 0
+        electrics.values.steering_input = steerVal + w
+        electrics.values.steering = (electrics.values.steering or 0) + w
       end
     end
   ]], wobble.amp, wobble.freq1, wobble.freq2)
@@ -115,16 +273,18 @@ local function assignPersona(vid)
   end
 
   vehiclePersonas[vid] = data
-  log('I', 'drunk_driver', string.format('Vehicle %d assigned persona: %s (aggression=%.2f, speed=%.1f, aiMode=%s)',
+  log('W', 'drunk_driver', string.format('Vehicle %d assigned persona: %s (aggression=%.2f, speed=%.1f, aiMode=%s)',
     vid, persona.name, data.aggression, data.speed, tostring(data.aiMode or "traffic")))
   return data
 end
 
 local function applyPersona(vid, data)
   local veh = be:getObjectByID(vid)
-  if veh then
-    veh:queueLuaCommand(data.vluaCmd)
+  if not veh then
+    vehiclePersonas[vid] = nil
+    return
   end
+  veh:queueLuaCommand(data.vluaCmd)
 end
 
 local function injectSteerHook(vid, data)
@@ -162,6 +322,7 @@ local function adoptExistingTraffic()
 end
 
 local function onPreRender(dtReal, dtSim, dtRaw)
+  renderSettingsWindow()
   reapplyTimer = reapplyTimer + dtSim
   if reapplyTimer < reapplyInterval then return end
   reapplyTimer = 0
@@ -195,8 +356,25 @@ local function onTrafficStarted()
   adoptExistingTraffic()
 end
 
+local function setupKeybind()
+  local am = scenetree.findObject("DrunkDriverActionMap")
+  if not am then
+    am = createObject("ActionMap")
+    am:registerObject("DrunkDriverActionMap")
+  end
+  am:bindCmd("keyboard", "lctrl+lalt+lshift+d", "extensions.drunk_driver.toggleSettings()", "")
+  am:push()
+end
+
+local function onExtensionLoaded()
+  loadSettings()
+  setupKeybind()
+  log('W', 'drunk_driver', 'Drunk Driver mod loaded - traffic personas active (Ctrl+Alt+Shift+D for settings)')
+  adoptExistingTraffic()
+end
+
 local function onInit()
-  log('I', 'drunk_driver', 'Drunk Driver mod loaded - traffic personas active')
+  log('W', 'drunk_driver', 'Drunk Driver mod initialized')
   adoptExistingTraffic()
 end
 
@@ -206,18 +384,20 @@ end
 
 local function listPersonas()
   for _, p in ipairs(personas) do
-    log('I', 'drunk_driver', string.format('  %s (weight: %d, aggression: %.1f-%.1f, speed: %.0f-%.0f m/s, aiMode=%s)',
+    log('W', 'drunk_driver', string.format('  %s (weight: %d, aggression: %.1f-%.1f, speed: %.0f-%.0f m/s, aiMode=%s)',
       p.name, p.weight, p.aggression[1], p.aggression[2], p.speed[1], p.speed[2], tostring(p.aiMode or "traffic")))
   end
 end
 
 M.onInit = onInit
+M.onExtensionLoaded = onExtensionLoaded
 M.onUpdate = onUpdate
 M.onPreRender = onPreRender
 M.onVehicleSpawned = onVehicleSpawned
 M.onVehicleDestroyed = onVehicleDestroyed
 M.onTrafficStarted = onTrafficStarted
 M.getVehiclePersona = getVehiclePersona
+M.toggleSettings = toggleSettings
 M.listPersonas = listPersonas
 
 return M
